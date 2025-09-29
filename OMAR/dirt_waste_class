@@ -1,0 +1,987 @@
+# YOLOv8 Transfer Learning System for Waste/Dirt Detection
+# Using Pre-trained Models + TrashNet Dataset + Optimized Fine-tuning
+# Author: AI Team
+
+import os
+import cv2
+import json
+import time
+import numpy as np
+import requests
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import yaml
+from datetime import datetime
+import shutil
+
+# Import YOLO from ultralytics
+try:
+    from ultralytics import YOLO
+except ImportError:
+    print("Installing ultralytics...")
+    os.system("pip install ultralytics")
+    from ultralytics import YOLO
+
+# ============================================================================
+# 1. TRASHNET DATASET DOWNLOADER & PROCESSOR
+# ============================================================================
+
+class TrashNetProcessor:
+    """Downloads and processes TrashNet dataset for YOLO training"""
+    
+    def __init__(self, dataset_path: str = "./trashnet_dataset"):
+        self.dataset_path = Path(dataset_path)
+        self.trashnet_url = "https://github.com/garythung/trashnet/archive/refs/heads/master.zip"
+        
+        # TrashNet classes mapped to our categories
+        self.class_mapping = {
+            'cardboard': 'waste',
+            'glass': 'waste', 
+            'metal': 'waste',
+            'paper': 'waste',
+            'plastic': 'waste',
+            'trash': 'waste'
+        }
+        
+        self.final_classes = ['dirt', 'waste']  # Our target classes
+        
+    def download_trashnet(self):
+        """Use existing dataset or download TrashNet as fallback"""
+        print("📥 Checking for existing TrashNet dataset...")
+        
+        # Use your existing dataset path
+        source_path = Path(r"C:\Users\pc\Downloads\archive\dataset-resized")
+        
+        if not source_path.exists():
+            print(f"❌ Existing dataset not found at {source_path}. Downloading TrashNet...")
+            zip_path = self.dataset_path / "trashnet.zip"
+            self.dataset_path.mkdir(exist_ok=True)
+            
+            if not zip_path.exists():
+                response = requests.get(self.trashnet_url, stream=True)
+                with open(zip_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print("✅ Download completed!")
+            
+            # Extract
+            if not (self.dataset_path / "trashnet-master").exists():
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(self.dataset_path)
+                print("✅ Extraction completed!")
+            
+            # Fallback to downloaded dataset path
+            source_path = self.dataset_path / "trashnet-master" / "data" / "dataset-resized"
+            if not source_path.exists():
+                source_path = self.dataset_path / "trashnet-master" / "data"  # Original dataset location
+        
+        # Debug: List class folders and image counts
+        print(f"Source path: {source_path}")
+        class_folders = [f for f in source_path.iterdir() if f.is_dir()]
+        print(f"Found {len(class_folders)} class folders: {[f.name for f in class_folders]}")
+        
+        total_images = 0
+        for class_folder in class_folders:
+            images = []
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+                images.extend(list(class_folder.glob(ext)))
+            print(f"  - {class_folder.name}: {len(images)} images")
+            total_images += len(images)
+        
+        if total_images == 0:
+            print("❌ No images found! Check extensions or folder contents.")
+            return None
+        
+        print(f"✅ Total images across classes: {total_images}")
+        return source_path
+    
+    def convert_to_yolo_format(self, source_path: Path):
+        """Convert TrashNet to YOLO format with our class mapping"""
+        print("🔄 Converting TrashNet to YOLO format...")
+        
+        # Create YOLO structure
+        yolo_path = self.dataset_path / "yolo_format"
+        for split in ['train', 'val', 'test']:
+            (yolo_path / split / 'images').mkdir(parents=True, exist_ok=True)
+            (yolo_path / split / 'labels').mkdir(parents=True, exist_ok=True)
+        
+        # Process each class folder
+        image_count = 0
+        label_count = 0
+        
+        for class_folder in source_path.iterdir():
+            if not class_folder.is_dir():
+                print(f"Skipping non-directory: {class_folder}")
+                continue
+                
+            class_name = class_folder.name.lower()
+            if class_name not in self.class_mapping:
+                print(f"⚠️  Skipping unknown class: {class_name}")
+                continue
+            
+            mapped_class = self.class_mapping[class_name]
+            class_id = self.final_classes.index(mapped_class)
+            
+            # Support multiple case-insensitive extensions
+            images = []
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+                images.extend(list(class_folder.glob(ext)))
+            
+            print(f"Processing {class_name} -> {mapped_class}: {len(images)} images")
+            
+            if not images:
+                print(f"⚠️  No images found in {class_folder}. Skipping.")
+                continue
+            
+            # Split images: 70% train, 20% val, 10% test
+            train_count = int(len(images) * 0.7)
+            val_count = int(len(images) * 0.2)
+            
+            splits = {
+                'train': images[:train_count],
+                'val': images[train_count:train_count + val_count],
+                'test': images[train_count + val_count:]
+            }
+            
+            for split, split_images in splits.items():
+                print(f"  {split} split: {len(split_images)} images")
+                for img_path in split_images:
+                    new_img_name = f"{class_name}_{img_path.stem}_{image_count}.jpg"
+                    new_img_path = yolo_path / split / 'images' / new_img_name
+                    
+                    img = cv2.imread(str(img_path))
+                    if img is None:
+                        print(f"  Failed to load: {img_path}")
+                        continue
+                        
+                    cv2.imwrite(str(new_img_path), img)
+                    
+                    # Create label (full image = one object)
+                    h, w = img.shape[:2]
+                    label_path = yolo_path / split / 'labels' / f"{new_img_name.replace('.jpg', '.txt')}"
+                    
+                    with open(label_path, 'w') as f:
+                        f.write(f"{class_id} 0.5 0.5 1.0 1.0\n")
+                    
+                    image_count += 1
+                    label_count += 1
+        
+        print(f"✅ Conversion completed! {image_count} images, {label_count} labels")
+        
+        if image_count == 0:
+            print("❌ No images processed. Check the debug output above.")
+            return None
+        
+        # Create dataset.yaml
+        dataset_config = {
+            'path': str(yolo_path.absolute()),
+            'train': 'train/images',
+            'val': 'val/images', 
+            'test': 'test/images',
+            'nc': len(self.final_classes),
+            'names': self.final_classes
+        }
+        
+        yaml_path = yolo_path / 'dataset.yaml'
+        with open(yaml_path, 'w') as f:
+            yaml.dump(dataset_config, f)
+        
+        print(f"📄 Dataset config saved to: {yaml_path}")
+        return str(yaml_path)
+    
+    def add_dirt_images(self, dirt_images_folder: str):
+        """Add dirt images to the dataset"""
+        print("🌱 Adding dirt images...")
+        
+        dirt_path = Path(dirt_images_folder)
+        if not dirt_path.exists():
+            print("⚠️  Dirt images folder not found. Creating placeholder...")
+            return
+        
+        yolo_path = self.dataset_path / "yolo_format"
+        dirt_images = []
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+            dirt_images.extend(list(dirt_path.glob(ext)))
+        
+        if not dirt_images:
+            print("⚠️  No dirt images found. You'll need to add them manually.")
+            return
+        
+        # Split dirt images across train/val/test
+        train_count = int(len(dirt_images) * 0.7)
+        val_count = int(len(dirt_images) * 0.2)
+        
+        splits = {
+            'train': dirt_images[:train_count],
+            'val': dirt_images[train_count:train_count + val_count],
+            'test': dirt_images[train_count + val_count:]
+        }
+        
+        dirt_class_id = 0  # 'dirt' is class 0
+        image_count = 0
+        
+        for split, split_images in splits.items():
+            for img_path in split_images:
+                new_img_name = f"dirt_{img_path.stem}_{image_count}.jpg"
+                new_img_path = yolo_path / split / 'images' / new_img_name
+                
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    continue
+                    
+                cv2.imwrite(str(new_img_path), img)
+                
+                label_path = yolo_path / split / 'labels' / f"{new_img_name.replace('.jpg', '.txt')}"
+                with open(label_path, 'w') as f:
+                    f.write(f"{dirt_class_id} 0.5 0.5 1.0 1.0\n")
+                
+                image_count += 1
+        
+        print(f"✅ Added {image_count} dirt images to dataset")
+
+# ============================================================================
+# 2. TRANSFER LEARNING TRAINER WITH OPTIMIZED AUGMENTATION
+# ============================================================================
+
+class TransferLearningTrainer:
+    """Optimized trainer for fine-tuning pre-trained YOLOv8 models"""
+    
+    def __init__(self, model_size: str = 'yolov8n'):
+        self.model_size = model_size
+        self.model = None
+        
+        self.transfer_learning_config = {
+            'lr0': 0.001,
+            'lrf': 0.01,
+            'momentum': 0.937,
+            'weight_decay': 0.0005,
+            'warmup_epochs': 3,
+            'warmup_momentum': 0.8,
+            'warmup_bias_lr': 0.1,
+            'box': 0.05,
+            'cls': 0.5,
+            'dfl': 1.5,
+            'hsv_h': 0.010,
+            'hsv_s': 0.5,
+            'hsv_v': 0.3,
+            'degrees': 5.0,
+            'translate': 0.05,
+            'scale': 0.3,
+            'shear': 2.0,
+            'perspective': 0.0001,
+            'flipud': 0.0,
+            'fliplr': 0.5,
+            'mosaic': 0.8,
+            'mixup': 0.1,
+            'copy_paste': 0.1,
+        }
+    
+    def fine_tune_model(self, dataset_yaml: str, epochs: int = 50, img_size: int = 640, 
+                       batch_size: int = 16, patience: int = 20):
+        print(f"🚀 Starting transfer learning with {self.model_size}")
+        print("📋 Using optimized augmentation for fine-tuning...")
+        
+        self.model = YOLO(f"{self.model_size}.pt")
+        print(f"✅ Loaded pre-trained {self.model_size} model")
+        
+        # Use GPU if available, fall back to CPU
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        results = self.model.train(
+            data=dataset_yaml,
+            epochs=epochs,  
+            imgsz=img_size,
+            batch=batch_size,
+            patience=patience,
+            name=f'transfer_learning_{self.model_size}',
+            project='runs/detect',
+            save=True,
+            plots=True,
+            device=device,
+            **self.transfer_learning_config
+        )
+        
+        print("🎉 Transfer learning completed!")
+        print(f"📊 Best mAP50: {results.results_dict.get('metrics/mAP50(B)', 'N/A')}")
+        print(f"📊 Best mAP50-95: {results.results_dict.get('metrics/mAP50-95(B)', 'N/A')}")
+        
+        return results
+    
+    def compare_augmentation_settings(self):
+        print("\n📊 AUGMENTATION COMPARISON:")
+        print("=" * 60)
+        
+        standard_aug = {
+            'hsv_h': 0.015, 'hsv_s': 0.7, 'hsv_v': 0.4,
+            'degrees': 10.0, 'translate': 0.1, 'scale': 0.5,
+            'shear': 5.0, 'mosaic': 1.0, 'mixup': 0.15
+        }
+        
+        print(f"{'Parameter':<15} {'Standard':<10} {'Transfer':<10} {'Why Reduced'}")
+        print("-" * 60)
+        
+        explanations = {
+            'hsv_h': 'Less color shift needed',
+            'hsv_s': 'Pre-trained knows colors',
+            'hsv_v': 'Brightness variation reduced', 
+            'degrees': 'Small rotations sufficient',
+            'translate': 'Less position variation',
+            'scale': 'Size variations reduced',
+            'shear': 'Less geometric distortion',
+            'mosaic': 'Lighter mixing of images',
+            'mixup': 'Subtle feature mixing'
+        }
+        
+        for param, standard_val in standard_aug.items():
+            transfer_val = self.transfer_learning_config.get(param, 'N/A')
+            why = explanations.get(param, '')
+            print(f"{param:<15} {standard_val:<10} {transfer_val:<10} {why}")
+    
+    def validate_model(self, dataset_yaml: str):
+        if self.model is None:
+            print("❌ No model loaded for validation")
+            return
+        
+        print("🔍 Validating fine-tuned model...")
+        results = self.model.val(data=dataset_yaml)
+        
+        return results
+
+# ============================================================================
+# 3. ENHANCED INFERENCE WITH CONFIDENCE CALIBRATION
+# ============================================================================
+
+class EnhancedWasteDirtDetector:
+    """Enhanced detector with confidence calibration for transfer learning"""
+    
+    def __init__(self, model_path: str, confidence_threshold: float = 0.5):
+        self.model_path = model_path
+        self.confidence_threshold = confidence_threshold
+        self.classes = ['dirt', 'waste']
+        
+        try:
+            self.model = YOLO(model_path)
+            print(f"✅ Transfer learning model loaded from {model_path}")
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            self.model = None
+    
+    def detect_with_confidence_analysis(self, frame: np.ndarray) -> Dict:
+        if self.model is None:
+            return {"objects": [], "error": "Model not loaded"}
+        
+        try:
+            confidence_levels = [0.3, 0.5, 0.7, 0.9]
+            results_by_conf = {}
+            
+            for conf in confidence_levels:
+                results = self.model(frame, conf=conf, verbose=False)
+                detections = []
+                
+                for result in results:
+                    boxes = result.boxes
+                    if boxes is not None:
+                        for box in boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            confidence = float(box.conf[0].cpu().numpy())
+                            class_id = int(box.cls[0].cpu().numpy())
+                            class_name = self.classes[class_id]
+                            
+                            bbox = [int(x1), int(y1), int(x2-x1), int(y2-y1)]
+                            
+                            detections.append({
+                                "class": class_name,
+                                "bbox": bbox,
+                                "confidence": round(confidence, 3)
+                            })
+                
+                results_by_conf[conf] = detections
+            
+            final_detections = results_by_conf.get(self.confidence_threshold, [])
+            
+            return {
+                "objects": final_detections,
+                "confidence_analysis": results_by_conf,
+                "timestamp": datetime.now().isoformat(),
+                "frame_shape": frame.shape,
+                "model_type": "transfer_learning"
+            }
+            
+        except Exception as e:
+            return {"objects": [], "error": str(e)}
+    
+    def adaptive_confidence_threshold(self, frame: np.ndarray) -> float:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        brightness = np.mean(gray)
+        contrast = np.std(gray)
+        
+        base_conf = 0.5
+        
+        if blur_score < 100:
+            base_conf -= 0.1
+        if brightness < 50 or brightness > 200:
+            base_conf -= 0.1
+        if contrast < 20:
+            base_conf -= 0.1
+        
+        return max(0.2, min(0.8, base_conf))
+
+# ============================================================================
+# 4. COMPREHENSIVE PERFORMANCE ANALYZER
+# ============================================================================
+
+class TransferLearningAnalyzer:
+    """Analyze performance of transfer learning vs training from scratch"""
+    
+    def __init__(self):
+        self.metrics_history = []
+    
+    def analyze_training_curves(self, runs_dir: str = "runs/detect"):
+        runs_path = Path(runs_dir)
+        
+        if not runs_path.exists():
+            print("❌ No training runs found")
+            return
+        
+        training_dirs = [d for d in runs_path.iterdir() if d.is_dir()]
+        if not training_dirs:
+            print("❌ No training directories found")
+            return
+        
+        latest_run = max(training_dirs, key=os.path.getctime)
+        results_csv = latest_run / "results.csv"
+        
+        if results_csv.exists():
+            print(f"📊 Analyzing training results from: {latest_run.name}")
+            import pandas as pd
+            try:
+                df = pd.read_csv(results_csv)
+                final_metrics = {
+                    'final_mAP50': df['metrics/mAP50(B)'].iloc[-1],
+                    'final_mAP50_95': df['metrics/mAP50-95(B)'].iloc[-1],
+                    'final_precision': df['metrics/precision(B)'].iloc[-1],
+                    'final_recall': df['metrics/recall(B)'].iloc[-1],
+                    'epochs_trained': len(df),
+                    'best_epoch': df['metrics/mAP50(B)'].idxmax(),
+                    'convergence_speed': self._analyze_convergence(df['metrics/mAP50(B)'])
+                }
+                
+                print("\n🎯 TRANSFER LEARNING RESULTS:")
+                print("=" * 40)
+                for metric, value in final_metrics.items():
+                    print(f"{metric:<20}: {value:.4f}")
+                
+                return final_metrics
+            except Exception as e:
+                print(f"❌ Error analyzing results: {e}")
+    
+    def _analyze_convergence(self, map_series) -> float:
+        final_map = map_series.iloc[-1]
+        target_map = final_map * 0.9
+        convergence_epoch = 0
+        for i, val in enumerate(map_series):
+            if val >= target_map:
+                convergence_epoch = i
+                break
+        return convergence_epoch / len(map_series)
+    
+    def compare_model_sizes(self, dataset_yaml: str):
+        model_sizes = ['yolov8n', 'yolov8s', 'yolov8m']
+        comparison_results = {}
+        
+        print("🔄 Comparing model sizes for transfer learning...")
+        
+        for model_size in model_sizes:
+            print(f"\n📋 Testing {model_size}...")
+            trainer = TransferLearningTrainer(model_size)
+            start_time = time.time()
+            results = trainer.fine_tune_model(dataset_yaml, epochs=10, batch_size=8)
+            training_time = time.time() - start_time
+            
+            comparison_results[model_size] = {
+                'training_time': training_time,
+                'model_params': self._get_model_params(model_size),
+                'inference_speed': self._test_inference_speed(trainer.model)
+            }
+        
+        return comparison_results
+    
+    def _get_model_params(self, model_size: str) -> int:
+        param_counts = {
+            'yolov8n': 3_200_000,
+            'yolov8s': 11_200_000,
+            'yolov8m': 25_900_000,
+            'yolov8l': 43_700_000,
+            'yolov8x': 68_200_000
+        }
+        return param_counts.get(model_size, 0)
+    
+    def _test_inference_speed(self, model) -> float:
+        dummy_image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
+        for _ in range(5):
+            model(dummy_image, verbose=False)
+        start_time = time.time()
+        for _ in range(10):
+            model(dummy_image, verbose=False)
+        avg_time = (time.time() - start_time) / 10
+        return 1.0 / avg_time
+
+# ============================================================================
+# 5. COMPLETE SYSTEM WITH TRANSFER LEARNING
+# ============================================================================
+
+class TransferLearningRobotAI:
+    """Complete system using transfer learning approach"""
+    
+    def __init__(self, model_path: str = None, confidence_threshold: float = 0.5):
+        if model_path:
+            self.detector = EnhancedWasteDirtDetector(model_path, confidence_threshold)
+        else:
+            self.detector = None
+        self.decision_maker = DecisionMaker()
+        
+    def setup_complete_pipeline(self, dirt_images_folder: str = None):
+        print("🚀 Setting up Transfer Learning Pipeline")
+        print("=" * 50)
+        
+        processor = TrashNetProcessor()
+        trashnet_data = processor.download_trashnet()
+        if trashnet_data is None:
+            print("❌ Failed to process dataset. Exiting.")
+            return None
+        dataset_yaml = processor.convert_to_yolo_format(trashnet_data)
+        if dataset_yaml is None:
+            print("❌ Failed to create dataset configuration. Exiting.")
+            return None
+        
+        if dirt_images_folder:
+            processor.add_dirt_images(dirt_images_folder)
+        
+        trainer = TransferLearningTrainer('yolov8s')
+        trainer.compare_augmentation_settings()
+        
+        print("\n🎓 Starting transfer learning training...")
+        results = trainer.fine_tune_model(dataset_yaml, epochs=50)
+        
+        best_model = f"runs/detect/transfer_learning_yolov8s/weights/best.pt"
+        self.detector = EnhancedWasteDirtDetector(best_model)
+        
+        analyzer = TransferLearningAnalyzer()
+        analyzer.analyze_training_curves()
+        
+        print("\n✅ Complete pipeline setup finished!")
+        return best_model
+    
+    def run_enhanced_detection(self, source: str = 0):
+        if self.detector is None:
+            print("❌ No detector loaded. Run setup_complete_pipeline() first.")
+            return
+        
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            print(f"❌ Could not open source: {source}")
+            return
+        
+        print("🎥 Starting enhanced detection with transfer learning model")
+        print("📊 Press 'q' to quit, 's' to save current frame analysis")
+        
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            detections = self.detector.detect_with_confidence_analysis(frame)
+            adaptive_conf = self.detector.adaptive_confidence_threshold(frame)
+            decision = self.decision_maker.make_decision(detections)
+            
+            vis_frame = self._visualize_enhanced_detection(frame, detections, decision, adaptive_conf)
+            cv2.imshow('Transfer Learning Detection', vis_frame)
+            
+            if detections["objects"]:
+                print(f"Frame {frame_count}: {len(detections['objects'])} objects | "
+                      f"Adaptive conf: {adaptive_conf:.2f} | Action: {decision['decision']}")
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                self._save_frame_analysis(frame, detections, decision, frame_count)
+            
+            frame_count += 1
+        
+        cap.release()
+        cv2.destroyAllWindows()
+    
+    def _visualize_enhanced_detection(self, frame, detections, decision, adaptive_conf):
+        vis_frame = frame.copy()
+        colors = {'dirt': (0, 255, 255), 'waste': (0, 0, 255)}
+        
+        for obj in detections.get("objects", []):
+            x, y, w, h = obj["bbox"]
+            class_name = obj["class"]
+            confidence = obj["confidence"]
+            color = colors.get(class_name, (255, 255, 255))
+            cv2.rectangle(vis_frame, (x, y), (x + w, y + h), color, 2)
+            label = f"{class_name}: {confidence:.3f}"
+            cv2.putText(vis_frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        info_y = 30
+        cv2.putText(vis_frame, f"Transfer Learning Model", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        info_y += 25
+        cv2.putText(vis_frame, f"Adaptive Conf: {adaptive_conf:.2f}", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+        info_y += 25
+        if decision["decision"] != "none":
+            cv2.putText(vis_frame, f"Action: {decision['decision']} - {decision['target_class']}", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        return vis_frame
+    
+    def _save_frame_analysis(self, frame, detections, decision, frame_count):
+        analysis = {
+            "frame_number": frame_count,
+            "timestamp": datetime.now().isoformat(),
+            "detections": detections,
+            "decision": decision,
+            "model_type": "transfer_learning"
+        }
+        filename = f"frame_analysis_{frame_count}_{datetime.now().strftime('%H%M%S')}.json"
+        with open(filename, 'w') as f:
+            json.dump(analysis, f, indent=2)
+        cv2.imwrite(f"frame_{frame_count}.jpg", frame)
+        print(f"💾 Saved analysis: {filename}")
+
+# ============================================================================
+# 6. DECISION MAKER (REUSE FROM ORIGINAL)
+# ============================================================================
+
+class DecisionMaker:
+    """Makes decisions based on detection results"""
+    
+    def __init__(self):
+        self.action_priority = {'waste': 1, 'dirt': 2}
+    
+    def make_decision(self, detections: Dict) -> Dict:
+        if not detections.get("objects"):
+            return {
+                "decision": "none",
+                "target_class": None,
+                "target_bbox": None,
+                "message": "No objects detected"
+            }
+        
+        objects = detections["objects"]
+        objects_with_priority = [(self.action_priority.get(obj["class"], 999), obj["confidence"], obj) for obj in objects]
+        objects_with_priority.sort(key=lambda x: (x[0], -x[1]))
+        target_obj = objects_with_priority[0][2]
+        
+        if target_obj["class"] == "waste":
+            decision = "pick"
+            message = "Pick up waste object"
+        elif target_obj["class"] == "dirt":
+            decision = "clean"
+            message = "Clean dirt spot"
+        else:
+            decision = "none"
+            message = "Unknown object type"
+        
+        return {
+            "decision": decision,
+            "target_class": target_obj["class"],
+            "target_bbox": target_obj["bbox"],
+            "confidence": target_obj["confidence"],
+            "message": message,
+            "total_objects": len(objects)
+        }
+
+# ============================================================================
+# 7. MAIN DEMO AND EXAMPLE USAGE
+# ============================================================================
+
+def demo_transfer_learning():
+    print("🎯 YOLO TRANSFER LEARNING DEMO")
+    print("=" * 50)
+    print("This demo will:")
+    print("1. Use existing TrashNet dataset")
+    print("2. Convert to YOLO format")
+    print("3. Fine-tune YOLOv8 with optimized settings")
+    print("4. Run enhanced detection")
+    print()
+    
+    robot_ai = TransferLearningRobotAI()
+    dirt_folder = input("Enter path to dirt images folder (or press Enter to skip): ").strip()
+    if not dirt_folder:
+        dirt_folder = None
+    
+    try:
+        model_path = robot_ai.setup_complete_pipeline(dirt_folder)
+        if model_path:
+            print("\n🎉 Setup completed successfully!")
+            print(f"📁 Trained model saved at: {model_path}")
+            
+            print("\nChoose next action:")
+            print("1. Real-time camera detection")
+            print("2. Process video file")
+            print("3. Test on images")
+            print("4. Skip to model analysis")
+            
+            choice = input("Enter choice (1-4): ").strip()
+            if choice == "1":
+                print("Starting camera detection...")
+                robot_ai.run_enhanced_detection(0)
+            elif choice == "2":
+                video_path = input("Enter video file path: ").strip()
+                robot_ai.run_enhanced_detection(video_path)
+            elif choice == "3":
+                test_single_images(robot_ai)
+            elif choice == "4":
+                print("📊 Running model analysis...")
+                analyzer = TransferLearningAnalyzer()
+                analyzer.analyze_training_curves()
+        
+    except KeyboardInterrupt:
+        print("\n⏹️  Demo interrupted by user")
+    except Exception as e:
+        print(f"❌ Error in demo: {e}")
+
+def test_single_images(robot_ai):
+    print("🖼️  Single Image Testing Mode")
+    print("Place test images in a 'test_images' folder")
+    
+    test_dir = Path("test_images")
+    if not test_dir.exists():
+        test_dir.mkdir()
+        print(f"📁 Created {test_dir} folder. Add your test images there.")
+        return
+    
+    image_files = list(test_dir.glob("*.jpg")) + list(test_dir.glob("*.png"))
+    if not image_files:
+        print("❌ No images found in test_images folder")
+        return
+    
+    print(f"📷 Found {len(image_files)} images to test")
+    for img_path in image_files:
+        print(f"\n🔍 Testing: {img_path.name}")
+        frame = cv2.imread(str(img_path))
+        if frame is None:
+            continue
+        
+        detections = robot_ai.detector.detect_with_confidence_analysis(frame)
+        decision = robot_ai.decision_maker.make_decision(detections)
+        
+        print(f"   Objects found: {len(detections.get('objects', []))}")
+        for obj in detections.get("objects", []):
+            print(f"   - {obj['class']}: {obj['confidence']:.3f}")
+        
+        if decision["decision"] != "none":
+            print(f"   🤖 Action: {decision['message']}")
+        
+        vis_frame = robot_ai._visualize_enhanced_detection(frame, detections, decision, 0.5)
+        cv2.imshow(f'Detection: {img_path.name}', vis_frame)
+        key = cv2.waitKey(0) & 0xFF
+        cv2.destroyAllWindows()
+        if key == ord('q'):
+            break
+
+def quick_start_existing_model():
+    print("🚀 QUICK START MODE")
+    print("=" * 30)
+    
+    model_path = input("Enter path to your trained model (.pt file): ").strip()
+    if not os.path.exists(model_path):
+        print("❌ Model file not found!")
+        return
+    
+    robot_ai = TransferLearningRobotAI(model_path)
+    print("✅ Model loaded successfully!")
+    print("\nChoose detection mode:")
+    print("1. Camera detection")
+    print("2. Video file")
+    print("3. Test images")
+    
+    choice = input("Enter choice (1-3): ").strip()
+    if choice == "1":
+        robot_ai.run_enhanced_detection(0)
+    elif choice == "2":
+        video_path = input("Enter video path: ").strip()
+        robot_ai.run_enhanced_detection(video_path)
+    elif choice == "3":
+        test_single_images(robot_ai)
+
+def show_transfer_learning_benefits():
+    print("\n🧠 TRANSFER LEARNING BENEFITS")
+    print("=" * 50)
+    print()
+    
+    benefits = {
+        "Training Time": {"From Scratch": "6-12 hours on GPU", "Transfer Learning": "30-60 minutes on GPU", "Improvement": "10-20x faster"},
+        "Data Requirements": {"From Scratch": "5,000+ images per class", "Transfer Learning": "500+ images per class", "Improvement": "10x less data needed"},
+        "Accuracy": {"From Scratch": "mAP 0.6-0.8 (with lots of data)", "Transfer Learning": "mAP 0.7-0.9 (with less data)", "Improvement": "Better accuracy with less data"},
+        "Convergence": {"From Scratch": "50-200 epochs to converge", "Transfer Learning": "20-50 epochs to converge", "Improvement": "4x faster convergence"}
+    }
+    
+    for category, details in benefits.items():
+        print(f"📊 {category}:")
+        for key, value in details.items():
+            if key == "Improvement":
+                print(f"   🎯 {key}: {value}")
+            else:
+                print(f"   {key}: {value}")
+        print()
+
+# ============================================================================
+# 8. CONFIGURATION AND UTILITIES
+# ============================================================================
+
+class ConfigManager:
+    @staticmethod
+    def get_speed_optimized_config():
+        return {'model_size': 'yolov8n', 'img_size': 416, 'confidence_threshold': 0.6, 'batch_size': 1, 'epochs': 30}
+    
+    @staticmethod
+    def get_accuracy_optimized_config():
+        return {'model_size': 'yolov8m', 'img_size': 640, 'confidence_threshold': 0.5, 'batch_size': 16, 'epochs': 100}
+    
+    @staticmethod
+    def get_balanced_config():
+        return {'model_size': 'yolov8s', 'img_size': 640, 'confidence_threshold': 0.5, 'batch_size': 8, 'epochs': 50}
+
+def print_system_requirements():
+    print("\n💻 SYSTEM REQUIREMENTS")
+    print("=" * 40)
+    print()
+    print("📦 Required Packages:")
+    print("pip install ultralytics opencv-python pyyaml numpy requests pandas")
+    print()
+    print("🖥️  Hardware Requirements:")
+    print("Minimum: CPU with 8GB RAM")
+    print("Recommended: NVIDIA GPU with 6GB+ VRAM")
+    print("For Raspberry Pi: Use speed-optimized config")
+    print()
+    print("📁 Storage Requirements:")
+    print("TrashNet dataset: ~1GB")
+    print("Trained models: ~20-100MB each")
+    print("Training logs/results: ~50MB")
+    print()
+    print("🌐 Internet Connection:")
+    print("Required for initial setup (downloading TrashNet)")
+    print("Optional during inference")
+
+# ============================================================================
+# 9. MAIN ENTRY POINT
+# ============================================================================
+
+def main():
+    print("🤖 YOLO TRANSFER LEARNING SYSTEM")
+    print("=" * 50)
+    print("Welcome to the advanced waste/dirt detection system!")
+    print()
+    
+    show_transfer_learning_benefits()
+    
+    print("\n📋 CHOOSE YOUR MODE:")
+    print("1. 🆕 Full Setup (Use Existing Dataset + Train Model)")
+    print("2. 🚀 Quick Start (Use Existing Model)")
+    print("3. 📊 Demo Transfer Learning")
+    print("4. 💻 Show System Requirements")
+    print("5. ❓ Help & Documentation")
+    print("6. 🔧 Configuration Generator")
+    
+    try:
+        choice = input("\nEnter your choice (1-6): ").strip()
+        if choice == "1":
+            demo_transfer_learning()
+        elif choice == "2":
+            quick_start_existing_model()
+        elif choice == "3":
+            print("📋 This will show you how the system works...")
+            print("Note: You need a trained model for full functionality")
+            demo_transfer_learning()
+        elif choice == "4":
+            print_system_requirements()
+        elif choice == "5":
+            print_help()
+        elif choice == "6":
+            generate_config()
+        else:
+            print("❌ Invalid choice. Please run again and select 1-6.")
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")
+    except Exception as e:
+        print(f"❌ An error occurred: {e}")
+        print("Please check your setup and try again.")
+
+def print_help():
+    print("\n📚 HELP & DOCUMENTATION")
+    print("=" * 40)
+    print()
+    print("🎯 WHAT THIS SYSTEM DOES:")
+    print("- Uses existing TrashNet dataset")
+    print("- Converts it to YOLO format")
+    print("- Fine-tunes pre-trained YOLOv8 models")
+    print("- Provides real-time waste/dirt detection")
+    print("- Makes intelligent cleaning decisions")
+    print()
+    print("📊 KEY FEATURES:")
+    print("✅ Transfer Learning (10x faster training)")
+    print("✅ Optimized augmentation settings")
+    print("✅ Adaptive confidence thresholds")
+    print("✅ Multi-level confidence analysis")
+    print("✅ Real-time performance monitoring")
+    print("✅ Comprehensive result analysis")
+    print()
+    print("🔧 TYPICAL WORKFLOW:")
+    print("1. Run full setup (uses existing dataset)")
+    print("2. Optionally add your own dirt images")
+    print("3. System trains YOLOv8 with transfer learning")
+    print("4. Use trained model for detection")
+    print("5. Analyze results and optimize")
+    print()
+    print("⚡ PERFORMANCE EXPECTATIONS:")
+    print("- Training: 30-60 minutes on GPU")
+    print("- Accuracy: mAP 0.7-0.9")
+    print("- Speed: 15-60 FPS depending on hardware")
+    print("- Data needed: 500+ images per class")
+
+def generate_config():
+    print("\n⚙️  CONFIGURATION GENERATOR")
+    print("=" * 40)
+    print()
+    print("What's your target hardware?")
+    print("1. 🖥️  Desktop/Server with GPU")
+    print("2. 💻 Laptop with moderate GPU")
+    print("3. 🥧 Raspberry Pi / Edge device")
+    print("4. ☁️  Cloud deployment")
+    
+    hw_choice = input("Enter choice (1-4): ").strip()
+    configs = {
+        "1": ConfigManager.get_accuracy_optimized_config(),
+        "2": ConfigManager.get_balanced_config(),
+        "3": ConfigManager.get_speed_optimized_config(),
+        "4": ConfigManager.get_accuracy_optimized_config()
+    }
+    
+    if hw_choice in configs:
+        config = configs[hw_choice]
+        print(f"\n📋 RECOMMENDED CONFIGURATION:")
+        print("=" * 35)
+        for key, value in config.items():
+            print(f"{key:<20}: {value}")
+        print(f"\n💾 GENERATED CODE:")
+        print("=" * 20)
+        print("# Use this configuration in your code:")
+        print(f"trainer = TransferLearningTrainer('{config['model_size']}')")
+        print(f"trainer.fine_tune_model(")
+        print(f"    dataset_yaml='dataset.yaml',")
+        print(f"    epochs={config['epochs']},")
+        print(f"    img_size={config['img_size']},")
+        print(f"    batch_size={config['batch_size']}")
+        print(f")")
+        print(f"detector = EnhancedWasteDirtDetector('model.pt', {config['confidence_threshold']})")
+    else:
+        print("❌ Invalid choice")
+
+if __name__ == "__main__":
+    main()
