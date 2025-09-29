@@ -1,6 +1,4 @@
-# YOLOv8 Transfer Learning System for Waste/Dirt Detection
-# Using Pre-trained Models + TrashNet Dataset + Optimized Fine-tuning
-# Author: AI Team
+
 
 import os
 import cv2
