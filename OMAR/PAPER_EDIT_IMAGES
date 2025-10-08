@@ -1,0 +1,555 @@
+import streamlit as st
+from ultralytics import YOLO
+from PIL import Image
+import cv2
+import numpy as np
+import os
+from pathlib import Path
+import zipfile
+import tempfile
+import shutil
+from datetime import datetime
+import io
+
+# Page configuration
+st.set_page_config(
+    page_title="YOLO Segmentation Tool",
+    page_icon="🔍",
+    layout="wide"
+)
+
+# Title and description
+st.title("🔍 YOLO Segmentation & Pseudo-Labeling Tool")
+st.markdown("Upload images or folders for segmentation and pseudo-labeling")
+
+# Sidebar for model configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    # Model path input
+    model_path = st.text_input(
+        "Model Path",
+        value=r"C:\Users\pc\Downloads\trassssh\paper.v2i.yolov8\runs\paper_seg_v2\weights\best.pt",
+        help="Path to your trained YOLO model"
+    )
+    
+    # Confidence threshold
+    conf_threshold = st.slider(
+        "Confidence Threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.25,
+        step=0.05,
+        help="Minimum confidence for predictions"
+    )
+    
+    # IOU threshold
+    iou_threshold = st.slider(
+        "IOU Threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.45,
+        step=0.05,
+        help="IOU threshold for NMS"
+    )
+    
+    st.divider()
+    st.markdown("### 📊 Features")
+    st.markdown("- ✅ Image/Folder Upload")
+    st.markdown("- ✅ Segmentation")
+    st.markdown("- ✅ Pseudo-Labeling")
+    st.markdown("- ✅ Mask Refinement")
+    st.markdown("- ✅ Download Results")
+
+# Load model
+@st.cache_resource
+def load_model(model_path):
+    try:
+        model = YOLO(model_path)
+        return model
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+        return None
+
+# Function to create YOLO format labels
+def create_yolo_label(result, img_width, img_height):
+    """Create YOLO format label from segmentation result"""
+    labels = []
+    
+    if result.masks is not None:
+        for i, mask in enumerate(result.masks.xy):
+            class_id = int(result.boxes.cls[i])
+            
+            # Normalize coordinates
+            normalized_coords = []
+            for point in mask:
+                x_norm = point[0] / img_width
+                y_norm = point[1] / img_height
+                normalized_coords.extend([x_norm, y_norm])
+            
+            # Format: class_id x1 y1 x2 y2 x3 y3 ...
+            label_line = f"{class_id} " + " ".join([f"{coord:.6f}" for coord in normalized_coords])
+            labels.append(label_line)
+    
+    return labels
+
+# Function to convert mask to YOLO format
+def mask_to_yolo(mask, class_id, img_w, img_h):
+    """Convert binary mask to YOLO polygon format"""
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if len(contours) == 0:
+        return None
+    
+    # Get largest contour
+    contour = max(contours, key=cv2.contourArea)
+    
+    # Simplify contour
+    epsilon = 0.001 * cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    
+    # Normalize coordinates
+    normalized_coords = []
+    for point in approx:
+        x_norm = point[0][0] / img_w
+        y_norm = point[0][1] / img_h
+        normalized_coords.extend([x_norm, y_norm])
+    
+    return f"{class_id} " + " ".join([f"{coord:.6f}" for coord in normalized_coords])
+
+# Function to process single image
+def process_image(model, image, conf, iou):
+    """Process a single image and return results"""
+    # Convert PIL image to numpy array
+    img_array = np.array(image)
+    
+    # Run prediction
+    results = model.predict(
+        source=img_array,
+        conf=conf,
+        iou=iou,
+        save=False,
+        show=False
+    )
+    
+    return results[0]
+
+# Function to save results
+def save_results(results_list, image_names, original_images, output_dir, refined_masks=None):
+    """Save original images, annotated images and labels"""
+    # Create directories
+    original_images_dir = os.path.join(output_dir, "original_images")
+    annotated_images_dir = os.path.join(output_dir, "annotated_images")
+    labels_dir = os.path.join(output_dir, "labels")
+    
+    os.makedirs(original_images_dir, exist_ok=True)
+    os.makedirs(annotated_images_dir, exist_ok=True)
+    os.makedirs(labels_dir, exist_ok=True)
+    
+    for idx, (result, img_name, original_img) in enumerate(zip(results_list, image_names, original_images)):
+        # Save original image
+        original_img_path = os.path.join(original_images_dir, img_name)
+        original_img.save(original_img_path)
+        
+        # Save annotated image
+        annotated_img = result.plot()
+        annotated_img_rgb = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
+        annotated_img_path = os.path.join(annotated_images_dir, img_name)
+        cv2.imwrite(annotated_img_path, cv2.cvtColor(annotated_img_rgb, cv2.COLOR_RGB2BGR))
+        
+        # Save YOLO format label
+        img_height, img_width = result.orig_shape
+        
+        # Use refined mask if available
+        if refined_masks and idx in refined_masks:
+            labels = []
+            for mask_info in refined_masks[idx]:
+                label = mask_to_yolo(mask_info['mask'], mask_info['class_id'], img_width, img_height)
+                if label:
+                    labels.append(label)
+        else:
+            labels = create_yolo_label(result, img_width, img_height)
+        
+        label_name = os.path.splitext(img_name)[0] + ".txt"
+        label_path = os.path.join(labels_dir, label_name)
+        
+        with open(label_path, 'w') as f:
+            f.write('\n'.join(labels))
+    
+    return original_images_dir, annotated_images_dir, labels_dir
+
+# Function to create zip file
+def create_zip(source_dir, zip_path):
+    """Create a zip file from directory"""
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(source_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, source_dir)
+                zipf.write(file_path, arcname)
+
+# Function to clean mask edges
+def clean_mask_edges(mask, kernel_size=5):
+    """Apply morphological operations to clean mask edges"""
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+# Function to dilate mask
+def dilate_mask(mask, kernel_size=5):
+    """Dilate mask to expand boundaries"""
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    return cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
+
+# Function to erode mask
+def erode_mask(mask, kernel_size=5):
+    """Erode mask to shrink boundaries"""
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    return cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
+
+# Function to convert numpy array to bytes for stable display
+def numpy_to_bytes(img_array):
+    """Convert numpy array to bytes for stable image display"""
+    if img_array.dtype != np.uint8:
+        img_array = img_array.astype(np.uint8)
+    img = Image.fromarray(img_array)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+# Main app
+def main():
+    # Load model
+    model = load_model(model_path)
+    
+    if model is None:
+        st.warning("⚠️ Please provide a valid model path")
+        return
+    
+    st.success("✅ Model loaded successfully!")
+    
+    # Display class names
+    if hasattr(model, 'names'):
+        st.info(f"📋 Classes: {', '.join(model.names.values())}")
+    
+    # Upload options
+    st.header("📤 Upload Images")
+    upload_option = st.radio(
+        "Choose upload method:",
+        ["Single/Multiple Images", "Folder (ZIP)"],
+        horizontal=True
+    )
+    
+    uploaded_files = None
+    
+    if upload_option == "Single/Multiple Images":
+        uploaded_files = st.file_uploader(
+            "Upload image(s)",
+            type=["jpg", "jpeg", "png", "bmp"],
+            accept_multiple_files=True
+        )
+    else:
+        uploaded_zip = st.file_uploader(
+            "Upload ZIP folder containing images",
+            type=["zip"]
+        )
+        
+        if uploaded_zip:
+            # Extract zip and load images into memory
+            with tempfile.TemporaryDirectory() as temp_dir:
+                zip_path = os.path.join(temp_dir, "upload.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(uploaded_zip.read())
+                
+                extract_dir = os.path.join(temp_dir, "extracted")
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+                
+                # Get all image files and load them into memory
+                image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
+                loaded_images = []
+                
+                for root, dirs, files in os.walk(extract_dir):
+                    for file in files:
+                        if any(file.lower().endswith(ext) for ext in image_extensions):
+                            img_path = os.path.join(root, file)
+                            try:
+                                # Load image into memory
+                                img = Image.open(img_path)
+                                # Convert to RGB if needed
+                                if img.mode != 'RGB':
+                                    img = img.convert('RGB')
+                                loaded_images.append({
+                                    'image': img.copy(),
+                                    'name': file
+                                })
+                            except Exception as e:
+                                st.warning(f"⚠️ Could not load {file}: {str(e)}")
+                
+                if loaded_images:
+                    st.success(f"✅ Loaded {len(loaded_images)} images from ZIP")
+                    st.session_state['zip_images'] = loaded_images
+                else:
+                    st.warning("⚠️ No images found in ZIP file")
+    
+    # Process button
+    if st.button("🚀 Run Segmentation & Generate Labels", type="primary"):
+        images_to_process = []
+        image_names = []
+        
+        # Collect images
+        if upload_option == "Single/Multiple Images" and uploaded_files:
+            for uploaded_file in uploaded_files:
+                img = Image.open(uploaded_file)
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                images_to_process.append(img)
+                image_names.append(uploaded_file.name)
+        
+        elif upload_option == "Folder (ZIP)" and 'zip_images' in st.session_state:
+            for img_data in st.session_state['zip_images']:
+                images_to_process.append(img_data['image'])
+                image_names.append(img_data['name'])
+        
+        if not images_to_process:
+            st.warning("⚠️ Please upload images first")
+            return
+        
+        # Process images
+        st.header("🔄 Processing...")
+        progress_bar = st.progress(0)
+        results_list = []
+        
+        for idx, (img, name) in enumerate(zip(images_to_process, image_names)):
+            st.write(f"Processing: {name}")
+            result = process_image(model, img, conf_threshold, iou_threshold)
+            results_list.append(result)
+            progress_bar.progress((idx + 1) / len(images_to_process))
+        
+        st.success("✅ Processing complete!")
+        
+        # Store in session state for mask editing
+        st.session_state['processed_results'] = results_list
+        st.session_state['processed_images'] = images_to_process
+        st.session_state['processed_names'] = image_names
+        
+        # Pre-render annotated images to avoid cache issues
+        annotated_images_cache = []
+        for result in results_list:
+            annotated_img = result.plot()
+            annotated_img_rgb = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
+            annotated_images_cache.append(annotated_img_rgb.copy())
+        st.session_state['annotated_images_cache'] = annotated_images_cache
+        
+        # Display results
+        st.header("📊 Results Preview")
+        cols = st.columns(3)
+        
+        for idx, (annotated_img_rgb, name) in enumerate(zip(annotated_images_cache[:6], image_names[:6])):
+            with cols[idx % 3]:
+                st.image(annotated_img_rgb, caption=name, width="stretch")
+                
+                # Show detection count
+                num_detections = len(results_list[idx].boxes) if results_list[idx].boxes is not None else 0
+                st.caption(f"Detections: {num_detections}")
+        
+        if len(results_list) > 6:
+            st.info(f"Showing 6 of {len(results_list)} images")
+    
+    # Mask Refinement Section
+    if 'processed_results' in st.session_state:
+        st.divider()
+        st.header("🎨 Mask Refinement")
+        
+        results_list = st.session_state['processed_results']
+        images_to_process = st.session_state['processed_images']
+        image_names = st.session_state['processed_names']
+        annotated_images_cache = st.session_state.get('annotated_images_cache', [])
+        
+        # Select image to refine
+        selected_idx = st.selectbox(
+            "Select image to refine:",
+            range(len(image_names)),
+            format_func=lambda x: image_names[x],
+            key="image_selector"
+        )
+        
+        result = results_list[selected_idx]
+        original_img = images_to_process[selected_idx]
+        
+        if result.masks is not None and len(result.masks) > 0:
+            # Select which mask to refine
+            mask_idx = st.selectbox(
+                "Select mask to refine:",
+                range(len(result.masks)),
+                format_func=lambda x: f"Mask {x+1} - {model.names[int(result.boxes.cls[x])]}",
+                key="mask_selector"
+            )
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Original Detection")
+                # Use cached annotated image
+                if selected_idx < len(annotated_images_cache):
+                    st.image(annotated_images_cache[selected_idx], width="stretch")
+                else:
+                    annotated_img = result.plot()
+                    annotated_img_rgb = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
+                    st.image(annotated_img_rgb, width="stretch")
+            
+            with col2:
+                st.subheader("Refinement Options")
+                
+                # Get mask
+                mask = result.masks.data[mask_idx].cpu().numpy()
+                mask_resized = cv2.resize(mask, (original_img.width, original_img.height))
+                mask_uint8 = (mask_resized * 255).astype(np.uint8)
+                
+                # Initialize refined mask in session state
+                state_key = f'refined_mask_{selected_idx}_{mask_idx}'
+                if state_key not in st.session_state:
+                    st.session_state[state_key] = mask_uint8.copy()
+                
+                # Refinement options
+                kernel_size = st.slider("Kernel Size", 1, 15, 5, step=2, key=f"kernel_{selected_idx}_{mask_idx}")
+                
+                col_a, col_b, col_c = st.columns(3)
+                
+                with col_a:
+                    if st.button("🧹 Clean Edges", key=f"clean_{selected_idx}_{mask_idx}"):
+                        st.session_state[state_key] = clean_mask_edges(st.session_state[state_key], kernel_size)
+                        st.success("✅ Edges cleaned!")
+                        st.rerun()
+                
+                with col_b:
+                    if st.button("➕ Dilate", key=f"dilate_{selected_idx}_{mask_idx}"):
+                        st.session_state[state_key] = dilate_mask(st.session_state[state_key], kernel_size)
+                        st.success("✅ Mask dilated!")
+                        st.rerun()
+                
+                with col_c:
+                    if st.button("➖ Erode", key=f"erode_{selected_idx}_{mask_idx}"):
+                        st.session_state[state_key] = erode_mask(st.session_state[state_key], kernel_size)
+                        st.success("✅ Mask eroded!")
+                        st.rerun()
+                
+                # Show refined mask
+                st.subheader("Refined Mask Preview")
+                
+                # Create visualization
+                img_array = np.array(original_img)
+                refined_mask = st.session_state[state_key]
+                
+                # Create colored overlay
+                overlay = img_array.copy()
+                overlay[refined_mask > 127] = [0, 0, 255]  # Blue for mask
+                
+                # Blend
+                result_img = cv2.addWeighted(img_array, 0.7, overlay, 0.3, 0)
+                
+                # Display using bytes to avoid cache issues
+                st.image(result_img, width="stretch")
+                
+                # Save refined mask
+                col_save, col_reset = st.columns(2)
+                
+                with col_save:
+                    if st.button("💾 Save Refined Mask", key=f"save_{selected_idx}_{mask_idx}"):
+                        # Store refined mask
+                        if 'refined_masks' not in st.session_state:
+                            st.session_state['refined_masks'] = {}
+                        
+                        if selected_idx not in st.session_state['refined_masks']:
+                            st.session_state['refined_masks'][selected_idx] = []
+                        
+                        class_id = int(result.boxes.cls[mask_idx])
+                        
+                        # Remove old mask for this index if exists
+                        st.session_state['refined_masks'][selected_idx] = [
+                            m for m in st.session_state['refined_masks'][selected_idx] 
+                            if m.get('original_idx') != mask_idx
+                        ]
+                        
+                        # Add new mask
+                        st.session_state['refined_masks'][selected_idx].append({
+                            'mask': st.session_state[state_key].copy(),
+                            'class_id': class_id,
+                            'original_idx': mask_idx
+                        })
+                        
+                        st.success("✅ Mask saved!")
+                
+                with col_reset:
+                    if st.button("🔄 Reset to Original", key=f"reset_{selected_idx}_{mask_idx}"):
+                        st.session_state[state_key] = mask_uint8.copy()
+                        st.rerun()
+        else:
+            st.warning("⚠️ No masks detected in this image")
+        
+        # Download section
+        st.divider()
+        st.header("💾 Download Results")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📥 Download All (Original Predictions)", width="stretch"):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    output_dir = os.path.join(temp_dir, "results")
+                    
+                    with st.spinner("Saving results..."):
+                        save_results(results_list, image_names, images_to_process, output_dir)
+                    
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    zip_path = os.path.join(temp_dir, f"yolo_results_{timestamp}.zip")
+                    create_zip(output_dir, zip_path)
+                    
+                    with open(zip_path, "rb") as f:
+                        st.download_button(
+                            label="📥 Download ZIP",
+                            data=f.read(),
+                            file_name=f"yolo_results_{timestamp}.zip",
+                            mime="application/zip",
+                            key="download_original"
+                        )
+        
+        with col2:
+            if st.button("📥 Download All (With Refined Masks)", width="stretch"):
+                refined_masks = st.session_state.get('refined_masks', {})
+                
+                if not refined_masks:
+                    st.warning("⚠️ No refined masks available. Refine masks first!")
+                else:
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        output_dir = os.path.join(temp_dir, "results_refined")
+                        
+                        with st.spinner("Saving results with refined masks..."):
+                            save_results(results_list, image_names, images_to_process, 
+                                       output_dir, refined_masks)
+                        
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        zip_path = os.path.join(temp_dir, f"yolo_refined_{timestamp}.zip")
+                        create_zip(output_dir, zip_path)
+                        
+                        with open(zip_path, "rb") as f:
+                            st.download_button(
+                                label="📥 Download ZIP with Refinements",
+                                data=f.read(),
+                                file_name=f"yolo_refined_{timestamp}.zip",
+                                mime="application/zip",
+                                key="download_refined"
+                            )
+        
+        st.info("""
+        **📁 Package Contents:**
+        - `original_images/` - Original uploaded images (unchanged)
+        - `annotated_images/` - Annotated images with segmentation masks
+        - `labels/` - YOLO format labels (.txt files) for pseudo-labeling
+        
+        **💡 Tip:** Use `original_images/` and `labels/` folders for training new models!
+        """)
+
+if __name__ == "__main__":
+    main()
