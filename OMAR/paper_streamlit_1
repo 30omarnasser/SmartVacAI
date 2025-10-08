@@ -1,0 +1,296 @@
+import streamlit as st
+from ultralytics import YOLO
+from PIL import Image
+import cv2
+import numpy as np
+import os
+from pathlib import Path
+import zipfile
+import tempfile
+import shutil
+from datetime import datetime
+
+# Page configuration
+st.set_page_config(
+    page_title="YOLO Segmentation Tool",
+    page_icon="🔍",
+    layout="wide"
+)
+
+# Title and description
+st.title("🔍 YOLO Segmentation & Pseudo-Labeling Tool")
+st.markdown("Upload images or folders for segmentation and pseudo-labeling with your trained YOLO model")
+
+# Sidebar for model configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    # Model path input
+    model_path = st.text_input(
+        "Model Path",
+        value=r"C:\Users\pc\Downloads\trassssh\paper.v2i.yolov8\runs\paper_seg_v2\weights\best.pt",
+        help="Path to your trained YOLO model"
+    )
+    
+    # Confidence threshold
+    conf_threshold = st.slider(
+        "Confidence Threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.25,
+        step=0.05,
+        help="Minimum confidence for predictions"
+    )
+    
+    # IOU threshold
+    iou_threshold = st.slider(
+        "IOU Threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.45,
+        step=0.05,
+        help="IOU threshold for NMS"
+    )
+    
+    st.divider()
+    st.markdown("### 📊 Features")
+    st.markdown("- ✅ Image/Folder Upload")
+    st.markdown("- ✅ Segmentation")
+    st.markdown("- ✅ Pseudo-Labeling")
+    st.markdown("- ✅ Download Results")
+
+# Load model
+@st.cache_resource
+def load_model(model_path):
+    try:
+        model = YOLO(model_path)
+        return model
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+        return None
+
+# Function to create YOLO format labels
+def create_yolo_label(result, img_width, img_height):
+    """Create YOLO format label from segmentation result"""
+    labels = []
+    
+    if result.masks is not None:
+        for i, mask in enumerate(result.masks.xy):
+            class_id = int(result.boxes.cls[i])
+            
+            # Normalize coordinates
+            normalized_coords = []
+            for point in mask:
+                x_norm = point[0] / img_width
+                y_norm = point[1] / img_height
+                normalized_coords.extend([x_norm, y_norm])
+            
+            # Format: class_id x1 y1 x2 y2 x3 y3 ...
+            label_line = f"{class_id} " + " ".join([f"{coord:.6f}" for coord in normalized_coords])
+            labels.append(label_line)
+    
+    return labels
+
+# Function to process single image
+def process_image(model, image, conf, iou):
+    """Process a single image and return results"""
+    # Convert PIL image to numpy array
+    img_array = np.array(image)
+    
+    # Run prediction
+    results = model.predict(
+        source=img_array,
+        conf=conf,
+        iou=iou,
+        save=False,
+        show=False
+    )
+    
+    return results[0]
+
+# Function to save results
+def save_results(results_list, image_names, output_dir):
+    """Save segmented images and labels"""
+    images_dir = os.path.join(output_dir, "images")
+    labels_dir = os.path.join(output_dir, "labels")
+    
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(labels_dir, exist_ok=True)
+    
+    for result, img_name in zip(results_list, image_names):
+        # Save annotated image
+        annotated_img = result.plot()
+        annotated_img_rgb = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
+        img_path = os.path.join(images_dir, img_name)
+        cv2.imwrite(img_path, cv2.cvtColor(annotated_img_rgb, cv2.COLOR_RGB2BGR))
+        
+        # Save YOLO format label
+        img_height, img_width = result.orig_shape
+        labels = create_yolo_label(result, img_width, img_height)
+        
+        label_name = os.path.splitext(img_name)[0] + ".txt"
+        label_path = os.path.join(labels_dir, label_name)
+        
+        with open(label_path, 'w') as f:
+            f.write('\n'.join(labels))
+    
+    return images_dir, labels_dir
+
+# Function to create zip file
+def create_zip(source_dir, zip_path):
+    """Create a zip file from directory"""
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(source_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, source_dir)
+                zipf.write(file_path, arcname)
+
+# Main app
+def main():
+    # Load model
+    model = load_model(model_path)
+    
+    if model is None:
+        st.warning("⚠️ Please provide a valid model path")
+        return
+    
+    st.success("✅ Model loaded successfully!")
+    
+    # Display class names
+    if hasattr(model, 'names'):
+        st.info(f"📋 Classes: {', '.join(model.names.values())}")
+    
+    # Upload options
+    st.header("📤 Upload Images")
+    upload_option = st.radio(
+        "Choose upload method:",
+        ["Single/Multiple Images", "Folder (ZIP)"],
+        horizontal=True
+    )
+    
+    uploaded_files = None
+    
+    if upload_option == "Single/Multiple Images":
+        uploaded_files = st.file_uploader(
+            "Upload image(s)",
+            type=["jpg", "jpeg", "png", "bmp"],
+            accept_multiple_files=True
+        )
+    else:
+        uploaded_zip = st.file_uploader(
+            "Upload ZIP folder containing images",
+            type=["zip"]
+        )
+        
+        if uploaded_zip:
+            # Extract zip
+            with tempfile.TemporaryDirectory() as temp_dir:
+                zip_path = os.path.join(temp_dir, "upload.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(uploaded_zip.read())
+                
+                extract_dir = os.path.join(temp_dir, "extracted")
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+                
+                # Get all image files
+                image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
+                image_files = []
+                
+                for root, dirs, files in os.walk(extract_dir):
+                    for file in files:
+                        if any(file.lower().endswith(ext) for ext in image_extensions):
+                            image_files.append(os.path.join(root, file))
+                
+                if image_files:
+                    st.success(f"✅ Found {len(image_files)} images in ZIP")
+                    # Store image paths in session state
+                    st.session_state['zip_images'] = image_files
+                else:
+                    st.warning("⚠️ No images found in ZIP file")
+    
+    # Process button
+    if st.button("🚀 Run Segmentation & Generate Labels", type="primary"):
+        images_to_process = []
+        image_names = []
+        
+        # Collect images
+        if upload_option == "Single/Multiple Images" and uploaded_files:
+            for uploaded_file in uploaded_files:
+                img = Image.open(uploaded_file)
+                images_to_process.append(img)
+                image_names.append(uploaded_file.name)
+        
+        elif upload_option == "Folder (ZIP)" and 'zip_images' in st.session_state:
+            for img_path in st.session_state['zip_images']:
+                img = Image.open(img_path)
+                images_to_process.append(img)
+                image_names.append(os.path.basename(img_path))
+        
+        if not images_to_process:
+            st.warning("⚠️ Please upload images first")
+            return
+        
+        # Process images
+        st.header("🔄 Processing...")
+        progress_bar = st.progress(0)
+        results_list = []
+        
+        for idx, (img, name) in enumerate(zip(images_to_process, image_names)):
+            st.write(f"Processing: {name}")
+            result = process_image(model, img, conf_threshold, iou_threshold)
+            results_list.append(result)
+            progress_bar.progress((idx + 1) / len(images_to_process))
+        
+        st.success("✅ Processing complete!")
+        
+        # Display results
+        st.header("📊 Results Preview")
+        cols = st.columns(3)
+        
+        for idx, (result, name) in enumerate(zip(results_list[:6], image_names[:6])):
+            with cols[idx % 3]:
+                annotated_img = result.plot()
+                annotated_img_rgb = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
+                st.image(annotated_img_rgb, caption=name, use_container_width=True)
+                
+                # Show detection count
+                num_detections = len(result.boxes) if result.boxes is not None else 0
+                st.caption(f"Detections: {num_detections}")
+        
+        if len(results_list) > 6:
+            st.info(f"Showing 6 of {len(results_list)} images")
+        
+        # Save and download
+        st.header("💾 Download Results")
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = os.path.join(temp_dir, "results")
+            
+            with st.spinner("Saving results..."):
+                images_dir, labels_dir = save_results(results_list, image_names, output_dir)
+            
+            # Create zip file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_path = os.path.join(temp_dir, f"yolo_results_{timestamp}.zip")
+            create_zip(output_dir, zip_path)
+            
+            # Download button
+            with open(zip_path, "rb") as f:
+                st.download_button(
+                    label="📥 Download All Results (Images + Labels)",
+                    data=f.read(),
+                    file_name=f"yolo_results_{timestamp}.zip",
+                    mime="application/zip"
+                )
+            
+            st.success("✅ Results ready for download!")
+            st.info("""
+            **📁 Package Contents:**
+            - `images/` - Annotated images with segmentation masks
+            - `labels/` - YOLO format labels (.txt files) for pseudo-labeling
+            """)
+
+if __name__ == "__main__":
+    main()
